@@ -52,7 +52,7 @@ async function importCsv(fileBuffer, groupId, importedBy) {
             group_id: groupId,
             imported_by: importedBy,
             total_rows: results.length,
-            original_filename: filePath.split(/[\\/]/).pop()
+            original_filename: 'expenses_export.csv'
           }, { transaction: t });
 
           let rowsImported = 0;
