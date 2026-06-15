@@ -73,6 +73,8 @@ async function calculateBalances(groupId) {
     b.net_balance = parseFloat((b.paid - b.owed + b.settlements_paid - b.settlements_received).toFixed(2));
   });
 
+  console.log('[BALANCE DEBUG] groupId:', groupId, 'paidResults:', JSON.stringify(paidResults), 'owedResults:', JSON.stringify(owedResults));
+
   return {
     balances: Object.values(balances),
     repayments: calculateRepaymentPlan(Object.values(balances))
