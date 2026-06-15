@@ -1,0 +1,21 @@
+# Secrets — never committed
+.env
+
+# Dependencies
+node_modules/
+
+# Multer uploads (temporary CSV files)
+uploads/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+node_modules
+.env
+.DS_Store
+uploads/*
+!.gitkeep
