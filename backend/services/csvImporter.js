@@ -86,6 +86,31 @@ async function importCsv(fileBuffer, groupId, importedBy) {
               }
             }
             
+            // Auto-onboard missing split_with members BEFORE anomaly detection
+            if (row.split_with && row.split_with.trim() !== '') {
+              const splitNames = row.split_with.split(';').map(n => n.trim()).filter(n => n);
+              for (const memberName of splitNames) {
+                let memberUser = findUserFuzzy(existingUsers, memberName);
+                if (!memberUser) {
+                  memberUser = await User.create({
+                    name: memberName,
+                    email: `${memberName.toLowerCase().replace(/\s+/g, '')}@auto-created.com`,
+                    password_hash: await authService.hashPassword('Password123!'),
+                    avatar_color: authService.generateAvatarColor(memberName)
+                  }, { transaction: t });
+                  
+                  const newMembership = await GroupMembership.create({
+                    group_id: groupId,
+                    user_id: memberUser.id,
+                    joined_at: new Date()
+                  }, { transaction: t });
+
+                  existingUsers.push(memberUser);
+                  existingMemberships.push({ ...newMembership.toJSON(), User: memberUser });
+                }
+              }
+            }
+
             // Detect Anomalies
             const anomalies = anomalyDetector.detectAnomalies(row, i + 1, existingMemberships, existingExpenses);
             
