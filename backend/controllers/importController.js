@@ -28,7 +28,7 @@ exports.uploadCsv = async (req, res, next) => {
       throw Object.assign(new Error('No CSV file uploaded.'), { status: 400 });
     }
 
-    const importLog = await csvImporter.importCsv(req.file.path, groupId, req.user.id);
+    const importLog = await csvImporter.importCsv(req.file.buffer, groupId, req.user.id);
 
     res.status(201).json({ importLog });
   } catch (err) {

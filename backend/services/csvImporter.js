@@ -5,7 +5,7 @@
  * Auto-creates missing users.
  */
 
-const fs = require('fs');
+const { Readable } = require('stream');
 const csv = require('csv-parser');
 const { sequelize, User, GroupMembership, Expense, ExpenseSplit, Settlement, ImportLog, ImportAnomaly } = require('../models');
 const anomalyDetector = require('./anomalyDetector');
@@ -21,11 +21,12 @@ function findUserFuzzy(existingUsers, nameStr) {
   });
 }
 
-async function importCsv(filePath, groupId, importedBy) {
+async function importCsv(fileBuffer, groupId, importedBy) {
   const results = [];
   
   return new Promise((resolve, reject) => {
-    fs.createReadStream(filePath)
+    const readable = Readable.from(fileBuffer);
+    readable
       .pipe(csv())
       .on('data', (data) => results.push(data))
       .on('end', async () => {

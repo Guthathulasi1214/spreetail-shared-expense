@@ -10,16 +10,8 @@ const path = require('path');
 const authenticate = require('../middleware/auth');
 const ctrl = require('../controllers/importController');
 
-// Configure multer storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, path.join(__dirname, '../uploads/'));
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + '.csv');
-  }
-});
+// Use memory storage — Render's filesystem is ephemeral so we never write to disk
+const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 router.use(authenticate);
