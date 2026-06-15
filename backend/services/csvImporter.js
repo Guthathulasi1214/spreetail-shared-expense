@@ -5,7 +5,7 @@
  * Auto-creates missing users.
  */
 
-const { Readable } = require('stream');
+const { Readable, PassThrough } = require('stream');
 const csv = require('csv-parser');
 const { sequelize, User, GroupMembership, Expense, ExpenseSplit, Settlement, ImportLog, ImportAnomaly } = require('../models');
 const anomalyDetector = require('./anomalyDetector');
@@ -25,8 +25,9 @@ async function importCsv(fileBuffer, groupId, importedBy) {
   const results = [];
   
   return new Promise((resolve, reject) => {
-    const readable = Readable.from(fileBuffer);
-    readable
+    const stream = new PassThrough();
+    stream.end(fileBuffer);
+    stream
       .pipe(csv())
       .on('data', (data) => results.push(data))
       .on('end', async () => {
