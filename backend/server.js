@@ -53,6 +53,7 @@ app.use('/api/groups',      require('./routes/settlements')); // /api/groups/:gr
 app.use('/api/groups',      require('./routes/imports'));     // /api/groups/:groupId/import
 
 // Health check — always available, useful for "is the server up?" during demo
+// NOTE: Must be defined BEFORE the 404 catch-all below
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });

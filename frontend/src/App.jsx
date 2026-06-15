@@ -7,9 +7,22 @@
  */
 
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { useEffect }          from 'react';
 import { AuthProvider }    from './context/AuthContext';
 import ProtectedRoute      from './components/ProtectedRoute';
 import Layout              from './components/layout/Layout';
+
+// Keep-alive ping: prevents Render free tier from sleeping (spins down after 15min inactivity)
+// Pings backend every 14 minutes silently in the background
+const BACKEND = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+function useKeepAlive() {
+  useEffect(() => {
+    const ping = () => fetch(`${BACKEND}/health`).catch(() => {});
+    ping(); // ping immediately on first load to wake up if sleeping
+    const id = setInterval(ping, 14 * 60 * 1000); // then every 14 minutes
+    return () => clearInterval(id);
+  }, []);
+}
 
 // ── Auth pages (Step 2) ───────────────────────────────────────────────────────
 import Login  from './pages/auth/Login';
@@ -44,6 +57,7 @@ function Stub({ label, step }) {
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 export default function App() {
+  useKeepAlive(); // Wake up + keep backend alive silently
   return (
     <AuthProvider>
       <BrowserRouter>
