@@ -1,332 +1,100 @@
-# SCOPE.md — Project Scope, Schema Reference, and CSV Anomaly Policies
+# SCOPE.md
 
-This document is the definitive reference for the live session. It covers:
-1. Database schema with field-level explanations
-2. All 20 CSV anomaly policies
-3. Supported endpoints overview
+## Database Schema
 
----
+I designed a normalized MySQL schema with the following tables. Sequelize models mirror this structure.
 
-## Database Schema Reference
+### users
+Stores login accounts. `avatar_color` is a deterministic hex color I generate per user so the UI can show colored initial-based avatars without needing image uploads.
 
-### `users`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | Auto-increment |
-| name | VARCHAR(100) | Display name |
-| email | VARCHAR(255) UNIQUE | Login identifier |
-| password_hash | VARCHAR(255) | bcrypt hash, never plaintext |
-| avatar_color | VARCHAR(7) | Hex color for initials avatar, set at signup |
-| created_at | TIMESTAMP | Auto-set |
+### groups
+A group represents a shared living arrangement (e.g., "the flat"). `created_by` tracks who set it up.
 
-### `groups`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | |
-| name | VARCHAR(150) | Group display name |
-| description | TEXT NULL | Optional |
-| created_by | INT UNSIGNED FK→users | Audit only; group persists if creator leaves |
-| created_at | TIMESTAMP | |
+### group_memberships
+This is the table I consider most important to the design. Rather than a simple boolean "is this person a member", I used a date-range model: `joined_at` and `left_at` (nullable - NULL means still active). This is what lets the app answer Sam's question ("why would March electricity affect my balance?") and Meera's situation (she left, so April expenses shouldn't be hers) correctly: balance calculations always check whether a person was an active member on the `expense_date` of each expense, not just whether they're a member "now".
 
-### `group_memberships`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | |
-| group_id | FK→groups | CASCADE delete |
-| user_id | FK→users | RESTRICT delete |
-| joined_at | DATE | Membership start |
-| left_at | DATE NULL | NULL = still active; date = left on this day |
+I also added a UNIQUE constraint on (group_id, user_id, joined_at) so a person could in theory leave and rejoin a group, producing two separate membership rows.
 
-**Key query:** "Was user X active on date D?"
-```sql
-WHERE user_id = X AND group_id = G
-  AND joined_at <= D
-  AND (left_at IS NULL OR left_at > D)
-```
+### expenses
+Stores each expense with `amount`, `currency`, `exchange_rate_to_inr`, and `amount_in_inr`. I store the exchange rate per-row rather than globally because historical rates shouldn't change retroactively if I update a "current" rate later. `is_active` is a soft-delete flag - I use this instead of hard-deleting duplicate rows, since Meera explicitly asked to approve anything the app deletes.
 
-### `expenses`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | |
-| group_id | FK→groups | |
-| description | VARCHAR(255) | |
-| amount | DECIMAL(12,4) | Original currency, 4dp |
-| currency | CHAR(3) | 'INR' or 'USD' |
-| exchange_rate_to_inr | DECIMAL(10,6) | Immutable per-row |
-| amount_in_inr | DECIMAL(12,2) | = amount × rate, used in ALL balance math |
-| paid_by_user_id | FK→users | |
-| split_type | ENUM | equal/unequal/percentage/share/settlement |
-| expense_date | DATE | |
-| notes | TEXT NULL | |
-| is_active | BOOLEAN | FALSE = soft-deleted |
-| created_at | TIMESTAMP | |
+### expense_splits
+One row per (expense, user) pair, storing `share_amount` (always populated, in INR - this is what balance calculations use), and optionally `share_percentage` or `share_units` for traceability when the split was percentage- or share-based. I chose a separate table over a JSON column specifically so that "how much does X owe for expense Y" is a simple indexed query, not something I need to parse out of JSON - this directly supports Rohan's "no magic numbers" requirement, since every balance figure can be traced back to a row in this table.
 
-### `expense_splits`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | |
-| expense_id | FK→expenses | CASCADE delete |
-| user_id | FK→users | |
-| share_amount | DECIMAL(12,2) | **Always set.** INR value this user owes |
-| share_percentage | DECIMAL(7,4) NULL | Set for PERCENTAGE splits |
-| share_units | DECIMAL(10,4) NULL | Set for SHARE splits |
+### settlements
+Direct person-to-person payments, kept separate from `expenses`. I made this decision because of row 14 in the CSV ("Rohan paid Aisha back") and row 38 ("Sam deposit share") - both are repayments between two people, not shared group costs, and mixing them into the expense ledger would distort group-wide totals (e.g., a "Rohan paid Aisha 5000" expense split among 4 people would incorrectly make everyone else responsible for part of that 5000).
 
-UNIQUE KEY on (expense_id, user_id) prevents double-counting.
-
-### `settlements`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | |
-| group_id | FK→groups | |
-| paid_by_user_id | FK→users | The payer |
-| paid_to_user_id | FK→users | The recipient |
-| amount | DECIMAL(12,2) | INR |
-| currency | CHAR(3) | Default 'INR' |
-| settled_date | DATE | |
-| notes | TEXT NULL | |
-| related_expense_id | FK→expenses NULL | Links to CSV-converted settlement source |
-| created_at | TIMESTAMP | |
-
-### `import_logs`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | |
-| group_id | FK→groups | |
-| imported_by | FK→users | Who uploaded the CSV |
-| imported_at | TIMESTAMP | |
-| total_rows | INT | All data rows parsed |
-| rows_imported | INT | Clean rows → inserted into expenses |
-| rows_skipped | INT | Auto-excluded (auto-resolved anomalies) |
-| rows_flagged | INT | Require approval |
-| original_filename | VARCHAR(255) NULL | |
-
-### `import_anomalies`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INT UNSIGNED PK | |
-| import_log_id | FK→import_logs | |
-| row_number | INT | 1-indexed |
-| raw_row_data | JSON | Original CSV row, never modified |
-| anomaly_type | VARCHAR(50) | See ANOMALY_TYPES in constants.js |
-| description | TEXT | Human-readable, Meera-friendly |
-| action_taken | TEXT NULL | What was/will be done |
-| requires_approval | BOOLEAN | TRUE = in approval queue |
-| approved | BOOLEAN NULL | NULL=pending, TRUE=approved, FALSE=rejected |
-| resolved_at | TIMESTAMP NULL | When Approve/Reject was clicked |
-| resolved_by | FK→users NULL | Who resolved it |
+### import_logs and import_anomalies
+`import_logs` is one row per CSV upload, storing summary counts (total/imported/skipped/flagged) for the import report. `import_anomalies` is one row per flagged CSV row, storing the original raw data (untouched, as JSON), the anomaly type, my description, the action taken, and an `approved` field (NULL = pending, TRUE/FALSE = resolved) - this table IS the approval queue that satisfies Meera's requirement.
 
 ---
 
-## CSV Format
+## Anomaly Log
 
-Input file columns: `date, description, paid_by, amount, currency, split_type, split_with, split_details, notes`
+I went through expenses_export.csv row by row and found the following data problems. For each, I describe what's wrong, my policy, and why.
 
-Data: 40 rows, Feb–Apr 2026, members: Aisha, Rohan, Priya, Meera (leaves 28-03-2026), Sam (joins mid-April), Dev (Goa trip guest 08-03 to 12-03).
+### 1. Numeric value stored with a thousands separator (Row 7: Electricity Feb, "1,200")
+**Policy:** Strip commas before parsing to a number. Auto-fixed, no approval needed - this is a pure formatting issue with no ambiguity.
 
----
+### 2. Excessive decimal precision (Row 10: Cylinder refill, 899.995)
+**Policy:** Round to 2 decimal places (standard currency precision) before storing. I defined `CURRENCY_DECIMALS = 2` as a named constant so this rule is easy to find and change.
 
-## CSV Anomaly Policies (All 20)
+### 3. Inconsistent name casing/whitespace (Row 9: "priya", Row 11: "Priya S", Row 27: "rohan ")
+**Policy:** Trim whitespace and fuzzy-match against existing group members during import. "priya" and "rohan " match "Priya"/"Rohan" with high confidence and are auto-corrected. "Priya S" is a superset match for "Priya" and is also normalized - I do not allow it to create a separate user record.
 
----
+### 4. Duplicate expense, same amount (Rows 5 & 6: "Dinner at Marina Bites" vs "dinner - marina bites")
+**Policy:** Same date, payer, amount, and overlapping participants - I treat this as a duplicate. The second occurrence (row 6) is marked `is_active = false` by default, but flagged with `requires_approval = true` so a human (Meera) confirms before it's permanently excluded.
 
-### #1 NUMERIC_FORMAT — Comma in number
-**Example:** `amount = "1,200"` (Electricity Feb)  
-**Detection:** Amount contains a comma character.  
-**Policy:** Strip commas before `parseFloat()`.  
-**Action:** Auto-fixed. Logged as `NUMERIC_FORMAT`. `requires_approval = false`.  
-**Anomaly type code:** `NUMERIC_FORMAT`
+### 5. Unequal split - verified it reconciles (Row 12: Aisha birthday cake)
+split_with lists Rohan, Priya, Meera and split_details gives 700 + 400 + 400 = 1500, which equals the total amount. I checked this manually before assuming it was broken - it isn't. **Policy:** import normally, Aisha correctly has no share (note explicitly says "Aisha not charged"). I documented this as a general validation: for unequal splits, I sum split_details and compare to the total; only flag if they don't match.
 
----
+### 6. Missing paid_by (Row 13: House cleaning supplies)
+**Policy:** An expense with no payer can't be assigned in the balance model. I exclude this row entirely from balances and flag it with `requires_approval = true` - someone needs to manually assign a payer before it counts.
 
-### #2 EXCESS_PRECISION — Too many decimal places
-**Example:** `amount = 899.995` (Cylinder refill)  
-**Detection:** Parsed float has more than `CURRENCY_DECIMALS` (2) significant decimal places.  
-**Policy:** Round using standard round-half-up to 2dp: `Math.round(value * 100) / 100`.  
-**Action:** Auto-fixed (899.995 → 900.00). Logged as `EXCESS_PRECISION`. `requires_approval = false`.  
-**Code constant:** `CURRENCY_DECIMALS = 2` in `constants.js`
+### 7. Settlement mislabeled as an expense (Row 14: "Rohan paid Aisha back", 5000 INR)
+split_type is empty and split_with contains exactly one person (Aisha) who isn't the payer. **Policy:** I detect this pattern (single non-payer in split_with, regardless of split_type) and convert it into a `settlements` record: Rohan paid Aisha 5000. This is auto-applied since the pattern is unambiguous.
 
----
+### 8. Percentage split exceeds 100% (Row 15: Pizza Friday, and Row 32: Weekend brunch - both 30+30+30+20 = 110%)
+**Policy:** I validate that percentage splits sum to ~100% (allowing a small floating-point epsilon). Both rows fail this. I exclude them from balances and flag with `requires_approval = true`. I deliberately do NOT auto-rescale the percentages to 100%, because that would silently change what people agreed to pay - a human needs to decide the correct percentages.
 
-### #3 NAME_NORMALIZED / NAME_UNRESOLVED — Inconsistent name casing/whitespace
-**Examples:** `"priya"`, `"Priya S"`, `"rohan "` (trailing space)  
-**Detection:** Name (after trim + lowercase) doesn't exactly match any group member name.  
-**Policy:**
-- Trim whitespace from both ends
-- Attempt case-insensitive fuzzy match (`.toLowerCase()` comparison, also try prefix matching for "Priya S" → "Priya")
-- Confident match (one unique result): auto-correct, log as `NAME_NORMALIZED`, `requires_approval = false`
-- No confident match: log as `NAME_UNRESOLVED`, `requires_approval = true`, exclude row until resolved  
-**Anomaly type codes:** `NAME_NORMALIZED` / `NAME_UNRESOLVED`
+### 9. Foreign currency entries (Rows 20, 21, 23, 26: Goa villa booking, Beach shack lunch, Parasailing, Parasailing refund - all USD)
+**Policy:** I store the original amount and currency, plus a computed `amount_in_inr` using a configurable `EXCHANGE_RATE_USD_TO_INR` constant (default 83). All balance math uses `amount_in_inr`. Each row is flagged in the import report stating the conversion applied, so Priya can see her dollars weren't treated as rupees 1:1.
 
----
+### 10. Non-member in a split (Row 23: Parasailing includes "Dev's friend Kabir")
+**Policy:** Kabir is not a flatmate and has no account in this system. I exclude him from the split and re-divide the amount among the remaining active participants (Aisha, Rohan, Priya, Dev), flagging this with `requires_approval = true` so a human can see the original 5-way split was reduced to 4-way.
 
-### #4 DUPLICATE_EXACT — Exact duplicate expense
-**Example:** `"Dinner at Marina Bites"` (08-02-2026, Dev, ₹3200) vs `"dinner - marina bites"` (same date/payer/amount)  
-**Detection:** Match on (normalized date, normalized paid_by, amount, currency, overlapping split_with set).  
-**Policy:**
-- Import FIRST occurrence normally
-- Second occurrence: `is_active = false` (soft-deleted)
-- `requires_approval = true` — user confirms which one to keep
-- Both rows shown side-by-side in approval UI  
-**Anomaly type code:** `DUPLICATE_EXACT`
+### 11. Negative amount / refund (Row 26: Parasailing refund, -30 USD)
+**Policy:** I treat a negative amount as a refund that reverses the original split direction - it's processed using the same split_type/split_with as a normal expense but with a negative amount, which nets out against the original Parasailing charge for each person. Auto-processed since the policy is well-defined, but flagged for visibility.
 
----
+### 12. Duplicate expense, different amounts (Rows 24 & 25: "Dinner at Thalassa" 2400 by Aisha vs "Thalassa dinner" 2450 by Rohan, same date)
+**Policy:** Unlike anomaly #4, these have different payers AND different amounts, and the note admits one may be wrong. I do not auto-resolve this - both rows are flagged with `requires_approval = true` and excluded from balances until a human picks one (or merges/edits them).
 
-### #5 UNEQUAL_MISMATCH — Unequal split details don't sum to total
-**Example:** Aisha birthday cake: Rohan 700 + Priya 400 + Meera 400 = 1500 ✓ (this one reconciles)  
-**Detection:** Sum of `split_details` values ≠ `amount` (with ±0.01 epsilon).  
-**Policy:**
-- If sum matches: import normally (as in the example)
-- If sum mismatches: `requires_approval = true`, exclude from balances, show actual sum in report
-- NEVER guess the missing amount  
-**Anomaly type code:** `UNEQUAL_MISMATCH`
+### 13. Unparseable date format (Row 27: "Mar-14")
+**Policy:** This doesn't match the file's dominant DD-MM-YYYY format. Based on its position between rows dated 12-03-2026 and 15-03-2026, I infer 14-03-2026 - but I still flag it with `requires_approval = true` so a human confirms the inference rather than silently trusting it.
 
----
+### 14. Missing currency (Row 28: Groceries DMart, 15-03-2026)
+**Policy:** Default to the group's base currency (INR), auto-applied, with a flag noting the assumption: "Currency defaulted to INR (assumed)."
 
-### #6 MISSING_PAID_BY — No payer specified
-**Example:** "House cleaning supplies" (22-02-2026, paid_by empty)  
-**Detection:** `paid_by` field is empty/null/whitespace after trim.  
-**Policy:** Cannot compute balances without a payer. `requires_approval = true`. Row excluded entirely until payer is manually assigned via approval UI.  
-**Anomaly type code:** `MISSING_PAID_BY`
+### 15. Zero-amount expense (Row 31: Dinner order Swiggy, amount = 0)
+The note says "counted twice earlier - fixing later". **Policy:** I import the row for audit-trail completeness, but since the amount is 0, no expense_splits are created - it has no balance impact. Flagged in the report as "zero-amount, no balance impact."
+
+### 16. Stale membership in split_with (Row 36: Groceries BigBasket, 02-04-2026, includes Meera)
+Meera's `left_at` is 28-03-2026, so she was not an active member on 02-04-2026 - the note itself says "oops Meera still in the group list". **Policy:** I cross-check each split_with member against `group_memberships` as of the expense_date. Meera is automatically excluded from this split and the amount is re-divided among the remaining active members (Aisha, Rohan, Priya). This is auto-applied since membership dates are authoritative, but it's still surfaced in the import report for visibility.
+
+### 17. Ambiguous date format (Row 34: "Deep cleaning service", 04-05-2026)
+The note explicitly asks "is this April 5 or May 4?" **Policy:** I default to DD-MM-YYYY (4 May 2026) for consistency with the rest of the file, but because the row itself raises doubt and the date affects which membership period applies, I flag it with `requires_approval = true` for human confirmation before it counts toward any balance.
+
+### 18. split_type/split_details mismatch (Row 42: Furniture for common room)
+split_type says "equal" but split_details provides weights (1;1;1;1). **Policy:** I flag this with `requires_approval = true`, but since the weights given are uniform, they're equivalent to an equal split anyway - I auto-resolve to EQUAL and note that split_details was redundant. If the weights had been unequal, this would instead require a human to choose between split_type and split_details.
+
+### 19. Person-to-person transaction miscategorized as an expense (Row 38: "Sam deposit share", 15000 INR)
+Same pattern as #7: split_with contains exactly one person (Aisha) who isn't the payer, even though split_type is "equal" this time. **Policy:** I detect this pattern regardless of split_type value and convert it to a settlement: Sam paid Aisha 15000. Auto-applied.
+
+### 20. Share-split validation (Row 22: Scooter rentals)
+split_details gives Aisha 1; Rohan 2; Priya 1; Dev 2 (6 total units), and all four are in split_with. I verified this row is valid - it's processed normally as a share split (each person's share = their units / 6 * total amount). I added a general validation: for share/unequal/percentage splits, if any split_with member is missing a corresponding entry in split_details, flag with `requires_approval = true`.
 
 ---
 
-### #7 CONVERTED_SETTLEMENT — Settlement mislabeled as expense
-**Example:** "Rohan paid Aisha back" (25-02-2026, ₹5000, split_with="Aisha" only)  
-**Detection:** `split_with` contains exactly ONE person who is not the payer (regardless of split_type).  
-**Policy:** Auto-convert: create row in `settlements` table (paid_by=Rohan, paid_to=Aisha, amount=5000), do NOT create an `expenses` row. `requires_approval = false` (pattern is unambiguous).  
-**Anomaly type code:** `CONVERTED_SETTLEMENT`
+## Known Issue (being actively worked on)
 
----
-
-### #8 PERCENTAGE_OVER_100 — Percentage split sums to >100%
-**Examples:** "Pizza Friday" (30+30+30+20=110%), "Weekend brunch" (same)  
-**Detection:** Sum of percentages in `split_details` > 100 + epsilon (0.01).  
-**Policy:** `requires_approval = true`. Exclude from balances. Show actual sum in report. **NEVER auto-rescale** — that silently changes what people agreed to.  
-**Anomaly type code:** `PERCENTAGE_OVER_100`
-
----
-
-### #9 FOREIGN_CURRENCY — USD expense
-**Examples:** Goa villa ($540), Beach shack lunch ($84), Parasailing ($150), Parasailing refund (-$30)  
-**Detection:** `currency = 'USD'` (or any non-INR currency).  
-**Policy:** Store original amount + currency. Compute `amount_in_inr = amount × EXCHANGE_RATE_USD_TO_INR`. All balance math uses `amount_in_inr`. Log each with rate used. `requires_approval = false`.  
-**Anomaly type code:** `FOREIGN_CURRENCY`
-
----
-
-### #10 NON_MEMBER_IN_SPLIT — Unknown person in split_with
-**Example:** "Parasailing" split_with includes "Dev's friend Kabir"  
-**Detection:** Name in `split_with` doesn't match any group member (after normalization).  
-**Policy:** `requires_approval = true`. Default action: exclude Kabir, re-divide among remaining members (Aisha/Rohan/Priya/Dev). Report clearly states "Kabir removed — share redistributed among 4 remaining members; original was 5-way split."  
-**Why not auto-add Kabir?** See DECISIONS.md #7.  
-**Anomaly type code:** `NON_MEMBER_IN_SPLIT`
-
----
-
-### #11 REFUND — Negative amount
-**Example:** Parasailing refund = -$30 (same group/date range as Parasailing expense)  
-**Detection:** Parsed amount < 0.  
-**Policy:** Process as a refund — same split_type and split_with as specified, but negative. This reverses the share direction for each person (they get money back). Auto-processed. `requires_approval = false`.  
-**Note:** `amount_in_inr` will be negative (e.g., -30 × 83 = -2490 INR). Balance math handles negative amounts naturally.  
-**Anomaly type code:** `REFUND`
-
----
-
-### #12 DUPLICATE_FUZZY — Duplicate with different amount/payer
-**Example:** "Dinner at Thalassa" (11-03, Aisha, ₹2400) vs "Thalassa dinner" (11-03, Rohan, ₹2450, notes: "Aisha also logged this I think hers is wrong")  
-**Detection:** Same date/group, description similarity > threshold (Levenshtein or token overlap), but different payer AND/OR different amount.  
-**Policy:** Both rows `requires_approval = true`. Both excluded from balances until a human picks or merges. Side-by-side comparison in approval UI. Do NOT auto-resolve.  
-**Anomaly type code:** `DUPLICATE_FUZZY`
-
----
-
-### #13 DATE_UNPARSEABLE — Unparseable date format
-**Example:** "Airport cab" date="Mar-14" (no year, inconsistent format)  
-**Detection:** Date string doesn't parse as DD-MM-YYYY.  
-**Policy:** Attempt multiple known formats (DD-MM-YYYY, YYYY-MM-DD, MMM-DD, DD-MMM-YYYY). If still ambiguous, infer from chronological position (this row sits between 12-03-2026 and 15-03-2026 → infer 14-03-2026). Still set `requires_approval = true` so human confirms before it counts toward balances.  
-**Anomaly type code:** `DATE_UNPARSEABLE`
-
----
-
-### #14 MISSING_CURRENCY — Currency field empty
-**Example:** "Groceries DMart" (15-03-2026, ₹2105, currency field blank)  
-**Detection:** `currency` field is empty/null/whitespace.  
-**Policy:** Default to group base currency (INR). `exchange_rate_to_inr = 1`. `requires_approval = false`. Flag: "Currency defaulted to INR (assumed)."  
-**Anomaly type code:** `MISSING_CURRENCY`
-
----
-
-### #15 ZERO_AMOUNT — Amount is zero
-**Example:** "Dinner order Swiggy" (22-03-2026, amount=0, notes: "counted twice earlier - fixing later")  
-**Detection:** Parsed amount === 0.  
-**Policy:** Import the expense row for audit trail (`is_active = true`), but create **no** `expense_splits` rows (zero amount → zero balance impact). `requires_approval = false`. Flag: "Zero-amount expense, no balance impact — likely correction of a duplicate."  
-**Anomaly type code:** `ZERO_AMOUNT`
-
----
-
-### #16 STALE_MEMBERSHIP — Member not active on expense date
-**Example:** "Groceries BigBasket" (02-04-2026) lists Meera in split_with, but Meera's `left_at = 28-03-2026`  
-**Detection:** Cross-check each name in `split_with` against `group_memberships` as of `expense_date`. If `joined_at > date OR left_at <= date` → stale.  
-**Policy:** Auto-exclude Meera from the split, re-divide among active members (Aisha, Rohan, Priya). `requires_approval = false`. Flag clearly: "Meera not active on 02-04-2026 (left 28-03-2026) — removed from split, re-divided among 3 remaining members."  
-**Anomaly type code:** `STALE_MEMBERSHIP`
-
----
-
-### #17 AMBIGUOUS_DATE — Date format ambiguous (DD-MM vs MM-DD)
-**Example:** "Deep cleaning service" date="04-05-2026" (April 5 or May 4?)  
-**Detection:** Date where day ≤ 12 (so it could be either DD-MM or MM-DD) AND the row's own notes flag uncertainty.  
-**Policy:** Default to DD-MM-YYYY (file's dominant format → 4 May 2026). Set `requires_approval = true` because the date affects which membership period applies (high-consequence for balance correctness).  
-**Anomaly type code:** `AMBIGUOUS_DATE`
-
----
-
-### #18 SPLIT_TYPE_MISMATCH — split_type conflicts with split_details
-**Example:** "Furniture for common room" (18-04-2026): `split_type="equal"` but `split_details="Aisha 1; Rohan 1; Priya 1; Sam 1"`  
-**Detection:** `split_type = 'equal'` but `split_details` is non-empty.  
-**Policy:** `requires_approval = true`. If weights in split_details are uniform (1;1;1;1 → equal anyway), auto-resolve to EQUAL and note "split_details ignored as redundant — weights uniform, consistent with split_type=equal." If weights were NOT uniform, keep `requires_approval = true` and let human choose between split_type or split_details.  
-**Anomaly type code:** `SPLIT_TYPE_MISMATCH`
-
----
-
-### #19 CONVERTED_SETTLEMENT (person-to-person via equal split_type)
-**Example:** "Sam deposit share" (08-04-2026, Sam pays ₹15000, split_with="Aisha" only, split_type=equal)  
-**Detection:** Same as #7 — `split_with` has exactly ONE person who is not the payer, regardless of `split_type`.  
-**Policy:** Same as #7 — treat as settlement: paid_by=Sam, paid_to=Aisha, amount=15000 → `settlements` table. Auto-applied. Flag: "Converted to settlement record."  
-**Note:** The split_type=equal is irrelevant — the detection rule is the single non-payer in split_with.  
-**Anomaly type code:** `CONVERTED_SETTLEMENT`
-
----
-
-### #20 SHARE_SPLIT_MISSING — Share split has missing unit entry
-**Example (valid):** "Scooter rentals" split_with=Aisha;Rohan;Priya;Dev, split_details="Aisha 1; Rohan 2; Priya 1; Dev 2" — all 4 present, VALID.  
-**Detection (invalid case):** Any member listed in `split_with` lacks a corresponding entry in `split_details` for SHARE/UNEQUAL/PERCENTAGE splits.  
-**Policy:** Valid case imports normally (shares: 1/6, 2/6, 1/6, 2/6 of total). Invalid case: `requires_approval = true`. Never assume a missing share is 0 or equal — that silently changes the split.  
-**Anomaly type code:** `SHARE_SPLIT_MISSING`
-
----
-
-### GUEST_MEMBER_CREATED — Auto-created guest user
-**Context:** Dev appears in the CSV (08-03 to 12-03) as both a payer and split member but doesn't exist as a user.  
-**Policy:** Auto-create Dev as a `users` record (name="Dev", email=`dev_guest_<timestamp>@import.local`, random password hash). Create `group_membership` with `joined_at=08-03-2026, left_at=13-03-2026`. Flag as `GUEST_MEMBER_CREATED`, `requires_approval = true` for date confirmation.  
-**Anomaly type code:** `GUEST_MEMBER_CREATED`
-
----
-
-### CATCH-ALL — Unknown anomaly
-Any row that is malformed or ambiguous in a way not covered above: `requires_approval = true`, clear description, excluded from balances.  
-**Anomaly type code:** `UNKNOWN`
-
----
-
-## Out of Scope
-
-The following features are explicitly NOT built (to keep the codebase explainable):
-
-- Push notifications / email alerts
-- Recurring expenses
-- Multi-currency support beyond INR/USD
-- Live exchange rate API integration
-- Expense categories / tags
-- Receipt image upload (beyond CSV import)
-- Group templates
-- Multi-group dashboard consolidation (dashboard shows aggregate, but all operations are per-group)
+During development I found that the membership-date inference for newly-created users was using today's date instead of dates derived from the CSV, which caused a wave of false "not an active member" flags. I caught this by comparing the approval queue against my documented anomaly list above - anything not on this list is either a new bug or something I missed, and this didn't match anything here. The fix (scan the full CSV first to establish correct historical join/leave dates, then validate) is documented in DECISIONS.md and AI_USAGE.md.
